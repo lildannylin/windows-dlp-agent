@@ -35,3 +35,10 @@ htmlcov/
 # OS
 Thumbs.db
 Desktop.ini
+
+# CA private keys / forged certs — never commit (§3.2)
+*.key
+*.pem
+ca/
+certs/
+!tests/**/*.pem
