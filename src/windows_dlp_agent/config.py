@@ -25,7 +25,19 @@ class Config:
     # Custom confidential keywords appended to the defaults (§4.1). None => defaults.
     keywords: list[str] | None = None
 
+    # Audit log path (JSONL). None => no audit sink.
+    audit_log: Path | None = None
+
+    # warn-with-override grant lifetime in seconds (§5).
+    override_ttl: float = 300.0
+
+    # Loopback port for the override control endpoint (§5). None disables it;
+    # an int (0 => ephemeral) enables it on 127.0.0.1.
+    control_port: int | None = None
+
     # Policy: which engine Action maps to actually dropping the request.
     # WARN and BLOCK both stop the request (warn = block + override prompt, §4.3/§5).
     def __post_init__(self) -> None:
         self.ca_dir = Path(self.ca_dir)
+        if self.audit_log is not None:
+            self.audit_log = Path(self.audit_log)

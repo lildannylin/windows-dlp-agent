@@ -11,9 +11,15 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Callable
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
-__all__ = ["AiRequest", "extract_prompt", "service_for_host"]
+__all__ = [
+    "AiRequest",
+    "extract_prompt",
+    "service_for_host",
+    "register_service",
+    "register_extractor",
+]
 
 
 @dataclass
@@ -46,6 +52,11 @@ def service_for_host(host: str) -> str | None:
         if needle in host:
             return name
     return None
+
+
+def register_service(host_substring: str, name: str) -> None:
+    """Add/override a known AI service mapping at runtime (§4.4 updatable map)."""
+    _KNOWN_SERVICES[host_substring.lower()] = name
 
 
 def _walk_strings(node: object, out: list[str]) -> None:
@@ -100,6 +111,43 @@ def _extract_claude(req: AiRequest) -> str | None:
     return "\n".join(parts) if parts else None
 
 
+def _walk_nested_json_strings(node: object, out: list[str]) -> None:
+    """Like _walk_strings but transparently descends into JSON-in-string values,
+    which is how Gemini's batchexecute nests the prompt."""
+    if isinstance(node, str):
+        stripped = node.strip()
+        if stripped[:1] in "[{":
+            try:
+                _walk_nested_json_strings(json.loads(node), out)
+                return
+            except ValueError:
+                pass
+        out.append(node)
+    elif isinstance(node, dict):
+        for v in node.values():
+            _walk_nested_json_strings(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_nested_json_strings(v, out)
+
+
+def _extract_gemini(req: AiRequest) -> str | None:
+    """Gemini: POST .../batchexecute, prompt buried in the f.req field."""
+    if "batchexecute" not in req.path:
+        return None
+    try:
+        text = req.body.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    freq = parse_qs(text).get("f.req", [None])[0]
+    if not freq:
+        return None
+    strings: list[str] = []
+    _walk_nested_json_strings(freq, strings)
+    meaningful = [s for s in strings if len(s) >= 2]
+    return "\n".join(meaningful) if meaningful else None
+
+
 def _extract_generic(req: AiRequest) -> str | None:
     """Fallback (§4.4): concatenate the largest string values in a JSON body,
     else treat the whole decoded body as text."""
@@ -122,7 +170,13 @@ def _extract_generic(req: AiRequest) -> str | None:
 _EXTRACTORS: list[Callable[[AiRequest], "str | None"]] = [
     _extract_chatgpt,
     _extract_claude,
+    _extract_gemini,
 ]
+
+
+def register_extractor(extractor: Callable[["AiRequest"], "str | None"]) -> None:
+    """Add a site-specific extractor (tried before the generic fallback)."""
+    _EXTRACTORS.append(extractor)
 
 
 def extract_prompt(host: str, path: str, body: bytes) -> str | None:

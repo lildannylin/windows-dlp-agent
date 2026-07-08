@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import urlencode
 
 from windows_dlp_agent.extract import (
     extract_prompt,
     host_from_url,
+    register_extractor,
+    register_service,
     service_for_host,
 )
 
@@ -36,6 +39,27 @@ def test_extract_claude_messages():
     ).encode()
     text = extract_prompt("claude.ai", "/api/organizations/x/chat_conversations/y/completion", body)
     assert "sk-abc" in text
+
+
+def test_extract_gemini_batchexecute():
+    inner = json.dumps([["please summarize AKIAIOSFODNN7EXAMPLE"], None, None])
+    freq = json.dumps([[["hNvQHb", inner, None, "generic"]]])
+    body = urlencode({"f.req": freq, "at": "token"}).encode()
+    text = extract_prompt("gemini.google.com", "/_/BardChatUi/data/batchexecute", body)
+    assert "AKIAIOSFODNN7EXAMPLE" in text
+
+
+def test_register_service_and_extractor():
+    register_service("myai.internal", "MyAI")
+    assert service_for_host("chat.myai.internal") == "MyAI"
+
+    def _mine(req):
+        if req.host == "myai.internal":
+            return "custom prompt from extractor"
+        return None
+
+    register_extractor(_mine)
+    assert extract_prompt("myai.internal", "/x", b"{}") == "custom prompt from extractor"
 
 
 def test_generic_fallback_json():

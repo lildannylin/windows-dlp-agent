@@ -21,11 +21,14 @@ from typing import Awaitable, Callable
 import h11
 import httpx
 
+from .audit import AuditLog, NullAuditLog
 from .ca import CertificateAuthority
 from .config import Config
-from .dlp import Action, DlpEngine, default_engine
+from .control import ControlServer
+from .dlp import Action, Decision, DlpEngine, default_engine
 from .extract import extract_prompt, service_for_host
 from .notify import Notifier, build_message, get_notifier
+from .override import OverrideStore, fingerprint
 
 log = logging.getLogger("windows_dlp_agent.proxy")
 
@@ -50,12 +53,22 @@ class MitmProxy:
         ca: CertificateAuthority | None = None,
         engine: DlpEngine | None = None,
         notifier: Notifier | None = None,
+        overrides: OverrideStore | None = None,
+        audit: AuditLog | NullAuditLog | None = None,
     ):
         self.config = config or Config()
         self.ca = ca or CertificateAuthority.load_or_generate(self.config.ca_dir)
         self.engine = engine or default_engine(keywords=self.config.keywords)
         self.notifier = notifier or get_notifier()
+        self.overrides = overrides or OverrideStore(self.config.override_ttl)
+        if audit is not None:
+            self.audit: AuditLog | NullAuditLog = audit
+        elif self.config.audit_log is not None:
+            self.audit = AuditLog(self.config.audit_log)
+        else:
+            self.audit = NullAuditLog()
         self._server: asyncio.AbstractServer | None = None
+        self._control: ControlServer | None = None
         self._client = httpx.AsyncClient(
             http2=True,
             verify=self.config.upstream_verify,
@@ -71,6 +84,10 @@ class MitmProxy:
         )
         sockets = ", ".join(str(s.getsockname()) for s in self._server.sockets or [])
         log.info("MITM proxy listening on %s", sockets)
+        if self.config.control_port is not None:
+            self._control = ControlServer(self.overrides, port=self.config.control_port)
+            await self._control.start()
+            log.info("override control endpoint on 127.0.0.1:%s", self._control.port)
         return self._server
 
     async def serve_forever(self) -> None:
@@ -79,6 +96,8 @@ class MitmProxy:
             await server.serve_forever()
 
     async def aclose(self) -> None:
+        if self._control is not None:
+            await self._control.aclose()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -165,14 +184,12 @@ class MitmProxy:
             headers = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in request.headers]
             method = request.method.decode("ascii")
 
-            decision_action, categories = self._inspect(host, path, method, body)
+            decision, prompt = self._inspect(host, path, method, body)
 
-            if decision_action >= Action.WARN:
-                # §5: do not forward; sensitive data never leaves the machine.
-                self._alert(categories, host, decision_action)
-                await self._send_block(conn, writer, decision_action, categories)
-            else:
+            if self._should_forward(host, path, decision, prompt):
                 await self._forward(conn, writer, host, port, method, path, headers, body)
+            else:
+                await self._send_block(conn, writer, decision.action, decision.categories)
 
             if conn.our_state is h11.MUST_CLOSE or conn.their_state is h11.MUST_CLOSE:
                 return
@@ -209,25 +226,56 @@ class MitmProxy:
 
     def _inspect(
         self, host: str, path: str, method: str, body: bytes
-    ) -> tuple[Action, list[str]]:
+    ) -> tuple[Decision, str | None]:
         if method not in ("POST", "PUT", "PATCH") or not body:
-            return Action.ALLOW, []
+            return Decision(Action.ALLOW), None
         prompt = extract_prompt(host, path, body)
         if not prompt:
-            return Action.ALLOW, []
+            return Decision(Action.ALLOW), None
         decision = self.engine.evaluate(prompt)
-        if decision.action is Action.ALLOW:
-            return Action.ALLOW, []
-        log.info(
-            "DLP %s on %s%s: %s",
-            decision.action.label, host, path,
-            ", ".join(f"{f.detector}({f.preview()})" for f in decision.findings),
-        )
-        return decision.action, decision.categories
+        if decision.action is not Action.ALLOW:
+            log.info(
+                "DLP %s on %s%s: %s",
+                decision.action.label, host, path,
+                ", ".join(f"{f.detector}({f.preview()})" for f in decision.findings),
+            )
+        return decision, prompt
 
-    def _alert(self, categories: list[str], host: str, action: Action) -> None:
+    def _should_forward(
+        self, host: str, path: str, decision: Decision, prompt: str | None
+    ) -> bool:
+        """Apply policy (§4.3/§5). Returns True to forward, False to block.
+
+        - ALLOW: forward.
+        - WARN: block, unless the user granted a one-shot override for this exact
+          content (warn-with-override) -> forward + audit the override.
+        - BLOCK: always block (never overridable).
+        """
         service = service_for_host(host)
-        title, message = build_message(categories, service, action.label)
+        if decision.action is Action.ALLOW:
+            return True
+
+        if decision.action is Action.WARN and prompt is not None:
+            fp = fingerprint(host, prompt)
+            if self.overrides.consume(fp):
+                log.info("override consumed for %s%s", host, path)
+                self.audit.record_override(host=host, service=service, fingerprint=fp)
+                self.audit.record_decision(
+                    host=host, service=service, path=path,
+                    decision=decision, outcome="allow-override",
+                )
+                return True
+
+        # §5: do not forward; sensitive data never leaves the machine.
+        self.audit.record_decision(
+            host=host, service=service, path=path,
+            decision=decision, outcome="block",
+        )
+        self._alert(decision, host, service)
+        return False
+
+    def _alert(self, decision: Decision, host: str, service: str | None) -> None:
+        title, message = build_message(decision.categories, service, decision.action.label)
         try:
             self.notifier.notify(title, message)
         except Exception:  # noqa: BLE001 -- never let a toast failure break the proxy
@@ -334,7 +382,7 @@ class MitmProxy:
         from .extract import host_from_url
 
         host = host_from_url(target)
-        action, categories = self._inspect(host, target, method, body)
+        decision, prompt = self._inspect(host, target, method, body)
         conn = h11.Connection(h11.SERVER)
         # Prime h11 with a synthetic request so response framing is valid.
         conn.receive_data(
@@ -346,11 +394,10 @@ class MitmProxy:
             ev = conn.next_event()
             if isinstance(ev, h11.EndOfMessage) or ev is h11.NEED_DATA:
                 break
-        if action >= Action.WARN:
-            self._alert(categories, host, action)
-            await self._send_block(conn, writer, action, categories)
-        else:
+        if self._should_forward(host, target, decision, prompt):
             await self._forward(conn, writer, host, 443, method, target, headers, body)
+        else:
+            await self._send_block(conn, writer, decision.action, decision.categories)
 
 
 ClientHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]

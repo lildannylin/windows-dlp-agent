@@ -21,3 +21,15 @@ def test_export_ca_writes_cert(tmp_path):
     assert rc == 0
     assert out.exists()
     assert b"BEGIN CERTIFICATE" in out.read_bytes()
+
+
+def test_deploy_bundle_writes_artifacts(tmp_path):
+    rc = main([
+        "--ca-dir", str(tmp_path / "ca"), "--port", "8080",
+        "deploy-bundle", str(tmp_path / "bundle"),
+    ])
+    assert rc == 0
+    bundle = tmp_path / "bundle"
+    assert (bundle / "proxy-policy.reg").exists()
+    assert (bundle / "proxy-ca.crt").exists()
+    assert (bundle / "install.ps1").exists()

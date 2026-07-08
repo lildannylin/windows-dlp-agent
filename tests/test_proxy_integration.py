@@ -187,3 +187,88 @@ async def test_api_key_is_blocked(stack):
     assert upstream.hits == []
     assert len(notifier.messages) == 1
 
+
+# --- warn-with-override (section 5) -----------------------------------------
+
+
+async def _grant_override(control_port: int, fp: str) -> int:
+    reader, writer = await asyncio.open_connection("127.0.0.1", control_port)
+    body = json.dumps({"fingerprint": fp}).encode()
+    writer.write(
+        b"POST /override HTTP/1.1\r\n"
+        b"host: 127.0.0.1\r\n"
+        b"content-type: application/json\r\n"
+        b"content-length: " + str(len(body)).encode() + b"\r\n\r\n" + body
+    )
+    await writer.drain()
+    line = await reader.readuntil(b"\r\n")
+    writer.close()
+    return int(line.split(b" ")[1])
+
+
+async def test_warn_blocks_then_override_forwards(tmp_path):
+    from windows_dlp_agent.control import ControlServer
+    from windows_dlp_agent.override import OverrideStore, fingerprint
+
+    ca = CertificateAuthority.generate()
+    upstream = _Upstream(ca)
+    await upstream.start()
+    overrides = OverrideStore(ttl_seconds=300)
+    notifier = RecordingNotifier()
+    config = Config(host="127.0.0.1", port=0, ca_dir=tmp_path / "ca", upstream_verify=False)
+    proxy = MitmProxy(config, ca=ca, notifier=notifier, overrides=overrides)
+    await proxy.start()
+    control = ControlServer(overrides, port=0)
+    await control.start()
+
+    try:
+        prompt = "please email me at alice@example.com"
+        body = _chatgpt_body(prompt)
+
+        # 1) WARN hit is blocked first, toast emitted, nothing forwarded.
+        status, _ = await _proxy_roundtrip(proxy.port, ca, upstream.port, body)
+        assert status == 451
+        assert upstream.hits == []
+        assert len(notifier.messages) == 1
+
+        # 2) User approves via the control endpoint.
+        fp = fingerprint("127.0.0.1", prompt)
+        assert await _grant_override(control.port, fp) == 200
+
+        # 3) Same content now forwards exactly once (one-shot override).
+        status, resp = await _proxy_roundtrip(proxy.port, ca, upstream.port, body)
+        assert status == 200
+        assert resp == b"upstream-ok"
+        assert len(upstream.hits) == 1
+
+        # 4) A further resend is blocked again (grant was one-shot).
+        status, _ = await _proxy_roundtrip(proxy.port, ca, upstream.port, body)
+        assert status == 451
+        assert len(upstream.hits) == 1
+    finally:
+        await control.aclose()
+        await proxy.aclose()
+        await upstream.stop()
+
+
+async def test_block_tier_cannot_be_overridden(tmp_path):
+    from windows_dlp_agent.override import OverrideStore, fingerprint
+
+    ca = CertificateAuthority.generate()
+    upstream = _Upstream(ca)
+    await upstream.start()
+    overrides = OverrideStore(ttl_seconds=300)
+    config = Config(host="127.0.0.1", port=0, ca_dir=tmp_path / "ca", upstream_verify=False)
+    proxy = MitmProxy(config, ca=ca, notifier=RecordingNotifier(), overrides=overrides)
+    await proxy.start()
+
+    try:
+        prompt = "my card 4111 1111 1111 1111"
+        overrides.grant(fingerprint("127.0.0.1", prompt))  # pre-granted, must be ignored
+        status, _ = await _proxy_roundtrip(proxy.port, ca, upstream.port, _chatgpt_body(prompt))
+        assert status == 451  # BLOCK tier ignores overrides
+        assert upstream.hits == []
+    finally:
+        await proxy.aclose()
+        await upstream.stop()
+
