@@ -315,8 +315,7 @@ class MitmProxy:
         headers: list[tuple[str, str]],
         body: bytes,
     ) -> None:
-        netloc = host if port == 443 else f"{host}:{port}"
-        url = f"https://{netloc}{path}"
+        url = _upstream_url(host, port, path)
         fwd_headers = [(k, v) for k, v in headers if k.lower() not in _HOP_BY_HOP]
         try:
             upstream = await self._client.request(
@@ -398,6 +397,20 @@ class MitmProxy:
             await self._forward(conn, writer, host, 443, method, target, headers, body)
         else:
             await self._send_block(conn, writer, decision.action, decision.categories)
+
+
+def _upstream_url(host: str, port: int, path: str) -> str:
+    """Build the upstream URL for a forwarded request.
+
+    - Absolute-form target (`http://host/...`, the plain-HTTP proxy case, §3.1):
+      used verbatim so we don't double the scheme.
+    - Origin-form target (`/path`, from a decrypted CONNECT tunnel): composed
+      into an https URL for `host` (with :port when non-default).
+    """
+    if path.startswith(("http://", "https://")):
+        return path
+    netloc = host if port == 443 else f"{host}:{port}"
+    return f"https://{netloc}{path}"
 
 
 ClientHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]
