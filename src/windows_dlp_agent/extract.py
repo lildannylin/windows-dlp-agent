@@ -71,7 +71,14 @@ def _walk_strings(node: object, out: list[str]) -> None:
 
 
 def _extract_chatgpt(req: AiRequest) -> str | None:
-    """ChatGPT: POST .../backend-api/(f/)conversation, messages[].content.parts[]."""
+    """ChatGPT: POST .../backend-api/(f/)conversation.
+
+    Current web payload (verified against live traffic):
+        {"action":"next","messages":[{"author":{"role":"user"},
+          "content":{"content_type":"text","parts":["<prompt>"]}, ...}], ...}
+    parts[] is usually strings; multimodal/voice turns can mix in dicts like
+    {"content_type":"audio_transcription","text":"..."} — pull their text too.
+    """
     if "conversation" not in req.path:
         return None
     data = req.json()
@@ -86,6 +93,10 @@ def _extract_chatgpt(req: AiRequest) -> str | None:
             for p in content.get("parts", []) or []:
                 if isinstance(p, str):
                     parts.append(p)
+                elif isinstance(p, dict):
+                    text = p.get("text") or p.get("content")
+                    if isinstance(text, str):
+                        parts.append(text)
         elif isinstance(content, str):
             parts.append(content)
     return "\n".join(parts) if parts else None

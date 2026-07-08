@@ -33,6 +33,53 @@ def test_extract_chatgpt_parts():
     assert "4111 1111 1111 1111" in text
 
 
+def test_extract_chatgpt_current_web_payload():
+    """Exact shape verified against live chatgpt.com traffic (author/content_type/action)."""
+    body = json.dumps(
+        {
+            "action": "next",
+            "messages": [
+                {
+                    "author": {"role": "user"},
+                    "content": {
+                        "content_type": "text",
+                        "parts": ["leak sk-abcdefghijklmnopqrstuvwxyz0123"],
+                    },
+                    "id": "aaaa-bbbb",
+                    "role": "user",
+                }
+            ],
+            "model": "gpt-4o",
+            "parent_message_id": "cccc-dddd",
+        }
+    ).encode()
+    text = extract_prompt("chatgpt.com", "/backend-api/f/conversation", body)
+    assert "sk-abcdefghijklmnopqrstuvwxyz0123" in text
+
+
+def test_extract_chatgpt_multimodal_dict_parts():
+    body = json.dumps(
+        {
+            "messages": [
+                {
+                    "author": {"role": "user"},
+                    "content": {
+                        "content_type": "multimodal_text",
+                        "parts": [
+                            {"content_type": "image_asset_pointer", "asset_pointer": "file-x"},
+                            {"content_type": "audio_transcription", "text": "my card 4111 1111 1111 1111"},
+                            "and some trailing text",
+                        ],
+                    },
+                }
+            ]
+        }
+    ).encode()
+    text = extract_prompt("chatgpt.com", "/backend-api/conversation", body)
+    assert "4111 1111 1111 1111" in text
+    assert "and some trailing text" in text
+
+
 def test_extract_claude_messages():
     body = json.dumps(
         {"messages": [{"role": "user", "content": "my key sk-abc"}]}
