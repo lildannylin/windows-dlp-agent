@@ -19,8 +19,14 @@ import pytest
 
 from windows_dlp_agent.ca import CertificateAuthority
 from windows_dlp_agent.config import Config
+from windows_dlp_agent.extract import register_service
 from windows_dlp_agent.notify import RecordingNotifier
 from windows_dlp_agent.proxy import MitmProxy
+
+# The local test upstream is reached via CONNECT 127.0.0.1:<port>, so the proxy
+# sees host "127.0.0.1". DLP only inspects recognized AI destinations, so we
+# register the loopback host as an AI service (generic sweep) for these tests.
+register_service("127.0.0.1", "TestAI")
 
 
 class _Upstream:

@@ -1,9 +1,13 @@
 """Extract the user's AI prompt text from an intercepted request (spec §4.4).
 
-Per-service extractors know each site's request shape; a generic fallback
-(largest string values in any JSON body) covers shadow-AI and unknown sites so
-DLP still runs on something meaningful. Endpoint/field mappings are meant to be
-updatable (§4.4).
+DLP must only inspect *AI prompt* traffic, never arbitrary web requests: the
+proxy MITMs every connection, so scanning every POST body would false-positive
+on Cloudflare challenges, telemetry, OAuth blobs, etc. and break the web
+(observed live). So extraction is gated to *recognized AI destinations* — each
+known host maps to its own extractor, and an unrecognized host returns None
+(not scanned). Shadow-AI hosts are opted in explicitly via register_service /
+register_extractor; a host registered without a bespoke extractor gets the
+generic JSON string sweep. Mappings are updatable at runtime (§4.4).
 """
 
 from __future__ import annotations
@@ -52,11 +56,6 @@ def service_for_host(host: str) -> str | None:
         if needle in host:
             return name
     return None
-
-
-def register_service(host_substring: str, name: str) -> None:
-    """Add/override a known AI service mapping at runtime (§4.4 updatable map)."""
-    _KNOWN_SERVICES[host_substring.lower()] = name
 
 
 def _walk_strings(node: object, out: list[str]) -> None:
@@ -177,40 +176,52 @@ def _extract_generic(req: AiRequest) -> str | None:
     return text or None
 
 
-# Ordered service-specific extractors; generic is applied last.
-_EXTRACTORS: list[Callable[[AiRequest], "str | None"]] = [
-    _extract_chatgpt,
-    _extract_claude,
-    _extract_gemini,
+Extractor = Callable[["AiRequest"], "str | None"]
+
+# host substring -> extractor. Only these hosts are ever inspected; a match's
+# extractor returning None means "not a prompt request on this AI host" (e.g. a
+# challenge/telemetry endpoint) and the request is passed through unscanned.
+_SERVICE_EXTRACTORS: list[tuple[str, Extractor]] = [
+    ("chatgpt.com", _extract_chatgpt),
+    ("chat.openai.com", _extract_chatgpt),
+    ("claude.ai", _extract_claude),
+    ("gemini.google.com", _extract_gemini),
 ]
 
 
-def register_extractor(extractor: Callable[["AiRequest"], "str | None"]) -> None:
-    """Add a site-specific extractor (tried before the generic fallback)."""
-    _EXTRACTORS.append(extractor)
+def register_service(host_substring: str, name: str, extractor: Extractor | None = None) -> None:
+    """Register an AI destination to inspect (§4.4 updatable map).
+
+    `name` is the display name (for toasts/audit). `extractor` parses its prompt;
+    omit it to use the generic JSON string sweep for a shadow-AI host.
+    """
+    hs = host_substring.lower()
+    _KNOWN_SERVICES[hs] = name
+    _SERVICE_EXTRACTORS.insert(0, (hs, extractor or _extract_generic))
+
+
+def register_extractor(host_substring: str, extractor: Extractor) -> None:
+    """Attach a bespoke extractor to an (already or newly) recognized AI host."""
+    _SERVICE_EXTRACTORS.insert(0, (host_substring.lower(), extractor))
 
 
 def extract_prompt(host: str, path: str, body: bytes) -> str | None:
-    """Best-effort prompt text for DLP. Returns None if nothing extractable.
+    """Prompt text for DLP, or None if this request must not be scanned.
 
-    For a KNOWN AI service, only its own extractor's designated prompt endpoint
-    is scanned; a None means "not a prompt request" (e.g. auth, telemetry, or a
-    Cloudflare /cdn-cgi/ challenge) and we do NOT fall through to the generic
-    string sweep — scanning those bodies produces false positives on the random
-    tokens they carry. The generic fallback is only for UNKNOWN / shadow-AI
-    hosts (spec §4.4).
+    Only recognized AI destinations are inspected (see module docstring). An
+    unrecognized host — Cloudflare challenges, Google/telemetry, any normal
+    site — returns None and is never swept, so DLP can't false-positive on and
+    block ordinary web traffic.
     """
     req = AiRequest(host=host, path=path, body=body)
-    for extractor in _EXTRACTORS:
-        try:
-            text = extractor(req)
-        except (KeyError, TypeError, ValueError):
-            text = None
-        if text:
-            return text
-    if service_for_host(host) is not None:
-        return None
-    return _extract_generic(req)
+    hl = host.lower()
+    for needle, extractor in _SERVICE_EXTRACTORS:
+        if needle in hl:
+            try:
+                return extractor(req) or None
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
 
 
 def host_from_url(url: str) -> str:

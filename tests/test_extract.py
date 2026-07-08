@@ -97,22 +97,28 @@ def test_extract_gemini_batchexecute():
 
 
 def test_register_service_and_extractor():
-    register_service("myai.internal", "MyAI")
-    assert service_for_host("chat.myai.internal") == "MyAI"
-
     def _mine(req):
-        if req.host == "myai.internal":
-            return "custom prompt from extractor"
-        return None
+        return "custom prompt from extractor"
 
-    register_extractor(_mine)
+    register_service("myai.internal", "MyAI", extractor=_mine)
+    assert service_for_host("chat.myai.internal") == "MyAI"
     assert extract_prompt("myai.internal", "/x", b"{}") == "custom prompt from extractor"
+
+
+def test_register_extractor_attaches_to_host():
+    def _other(req):
+        return "from register_extractor"
+
+    register_extractor("otherai.internal", _other)
+    assert extract_prompt("otherai.internal", "/x", b"{}") == "from register_extractor"
+    # a different, unregistered host is still not scanned
+    assert extract_prompt("nope.example", "/x", b"{}") is None
 
 
 def test_known_service_nonprompt_endpoint_not_scanned():
     """Regression (found via live Chrome): a known AI host's infra endpoints
-    (Cloudflare challenge, telemetry) must NOT be swept by the generic fallback,
-    or their random tokens false-positive. Only the real prompt endpoint counts."""
+    (Cloudflare challenge, telemetry) must NOT be swept, or their random tokens
+    false-positive. Only the real prompt endpoint yields a prompt."""
     challenge_body = b'{"token":"QJCcjZcEMW4qtiAVCN+LUYu3mOs5AiYbdelBFJPFLPb1I-KiKW"}'
     assert extract_prompt(
         "chatgpt.com",
@@ -121,25 +127,28 @@ def test_known_service_nonprompt_endpoint_not_scanned():
     ) is None
 
 
-def test_unknown_host_still_uses_generic():
-    # shadow-AI host (not in the known map) still gets the generic sweep
+def test_unrecognized_host_never_scanned():
+    """Regression (found via live Chrome): arbitrary hosts — Cloudflare
+    challenges, Google telemetry, any normal site — must NOT be scanned, so DLP
+    can't block ordinary web traffic. Even a body containing a real secret is
+    passed through untouched when the host isn't a recognized AI destination."""
     body = json.dumps({"q": "find AKIAIOSFODNN7EXAMPLE"}).encode()
-    assert "AKIAIOSFODNN7EXAMPLE" in extract_prompt("shadow.example", "/cdn-cgi/x", body)
+    assert extract_prompt("challenges.cloudflare.com", "/cdn-cgi/x", body) is None
+    assert extract_prompt("update.googleapis.com", "/service/update2/json", body) is None
+    assert extract_prompt("some-random-site.example", "/v1/ask", body) is None
 
 
-def test_generic_fallback_json():
+def test_shadow_ai_host_scanned_after_register_with_generic():
+    # A shadow-AI host is opted in explicitly; without a bespoke extractor it
+    # gets the generic JSON string sweep.
+    register_service("shadowai.example", "ShadowAI")
     body = json.dumps({"q": "find me AKIAIOSFODNN7EXAMPLE please"}).encode()
-    text = extract_prompt("some-shadow-ai.example", "/v1/ask", body)
+    text = extract_prompt("chat.shadowai.example", "/v1/ask", body)
     assert "AKIAIOSFODNN7EXAMPLE" in text
 
 
-def test_generic_fallback_plain_text():
-    text = extract_prompt("x.example", "/p", b"raw prompt body")
-    assert text == "raw prompt body"
-
-
-def test_returns_none_on_empty():
-    assert extract_prompt("x.example", "/p", b"") is None
+def test_returns_none_on_empty_even_for_known_host():
+    assert extract_prompt("chatgpt.com", "/backend-api/conversation", b"") is None
 
 
 def test_host_from_url():
