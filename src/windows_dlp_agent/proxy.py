@@ -231,7 +231,11 @@ class MitmProxy:
             return Decision(Action.ALLOW), None
         prompt = extract_prompt(host, path, body)
         if not prompt:
+            if service_for_host(host):
+                log.debug("no prompt extracted from %s%s (body %d bytes)", host, path, len(body))
             return Decision(Action.ALLOW), None
+        if service_for_host(host):
+            log.debug("extracted %d chars from %s%s: %r…", len(prompt), host, path, prompt[:80])
         decision = self.engine.evaluate(prompt)
         if decision.action is not Action.ALLOW:
             log.info(

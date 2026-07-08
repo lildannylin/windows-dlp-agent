@@ -109,6 +109,24 @@ def test_register_service_and_extractor():
     assert extract_prompt("myai.internal", "/x", b"{}") == "custom prompt from extractor"
 
 
+def test_known_service_nonprompt_endpoint_not_scanned():
+    """Regression (found via live Chrome): a known AI host's infra endpoints
+    (Cloudflare challenge, telemetry) must NOT be swept by the generic fallback,
+    or their random tokens false-positive. Only the real prompt endpoint counts."""
+    challenge_body = b'{"token":"QJCcjZcEMW4qtiAVCN+LUYu3mOs5AiYbdelBFJPFLPb1I-KiKW"}'
+    assert extract_prompt(
+        "chatgpt.com",
+        "/cdn-cgi/challenge-platform/h/b/fo/2388486502/xyz",
+        challenge_body,
+    ) is None
+
+
+def test_unknown_host_still_uses_generic():
+    # shadow-AI host (not in the known map) still gets the generic sweep
+    body = json.dumps({"q": "find AKIAIOSFODNN7EXAMPLE"}).encode()
+    assert "AKIAIOSFODNN7EXAMPLE" in extract_prompt("shadow.example", "/cdn-cgi/x", body)
+
+
 def test_generic_fallback_json():
     body = json.dumps({"q": "find me AKIAIOSFODNN7EXAMPLE please"}).encode()
     text = extract_prompt("some-shadow-ai.example", "/v1/ask", body)

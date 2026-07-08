@@ -191,7 +191,15 @@ def register_extractor(extractor: Callable[["AiRequest"], "str | None"]) -> None
 
 
 def extract_prompt(host: str, path: str, body: bytes) -> str | None:
-    """Best-effort prompt text for DLP. Returns None if nothing extractable."""
+    """Best-effort prompt text for DLP. Returns None if nothing extractable.
+
+    For a KNOWN AI service, only its own extractor's designated prompt endpoint
+    is scanned; a None means "not a prompt request" (e.g. auth, telemetry, or a
+    Cloudflare /cdn-cgi/ challenge) and we do NOT fall through to the generic
+    string sweep — scanning those bodies produces false positives on the random
+    tokens they carry. The generic fallback is only for UNKNOWN / shadow-AI
+    hosts (spec §4.4).
+    """
     req = AiRequest(host=host, path=path, body=body)
     for extractor in _EXTRACTORS:
         try:
@@ -200,6 +208,8 @@ def extract_prompt(host: str, path: str, body: bytes) -> str | None:
             text = None
         if text:
             return text
+    if service_for_host(host) is not None:
+        return None
     return _extract_generic(req)
 
 
