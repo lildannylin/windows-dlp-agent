@@ -69,6 +69,11 @@ class MitmProxy:
             self.audit = NullAuditLog()
         self._server: asyncio.AbstractServer | None = None
         self._control: ControlServer | None = None
+        # SSL context for upstream WebSocket connections (httpx handles _forward's).
+        self._ws_ssl_ctx = ssl.create_default_context()
+        if not self.config.upstream_verify:
+            self._ws_ssl_ctx.check_hostname = False
+            self._ws_ssl_ctx.verify_mode = ssl.CERT_NONE
         self._client = httpx.AsyncClient(
             http2=True,
             verify=self.config.upstream_verify,
@@ -183,6 +188,16 @@ class MitmProxy:
             path = request.target.decode("latin-1")
             headers = [(k.decode("latin-1"), v.decode("latin-1")) for k, v in request.headers]
             method = request.method.decode("ascii")
+
+            if _is_ws_upgrade(request.headers):
+                # WebSocket upgrade — h11 can't proxy it; hand off per policy (§5).
+                if self.config.websocket_policy == "block":
+                    log.info("WebSocket blocked (fail-closed) to %s%s", host, path)
+                    await self._send_block(conn, writer, Action.BLOCK, ["websocket"])
+                    return
+                trailing = conn.trailing_data[0]
+                await self._relay_websocket(reader, writer, host, port, request, trailing)
+                return
 
             decision, prompt = self._inspect(host, path, method, body)
 
@@ -319,36 +334,97 @@ class MitmProxy:
         headers: list[tuple[str, str]],
         body: bytes,
     ) -> None:
+        """Forward the request and stream the response back chunk-by-chunk.
+
+        Streaming (not buffering) so token-by-token replies (ChatGPT SSE) reach
+        the browser as they arrive. Raw upstream bytes are relayed verbatim with
+        the original content-encoding, re-framed to the client as HTTP/1.1
+        chunked (or content-length 0 for bodyless responses).
+        """
         url = _upstream_url(host, port, path)
         fwd_headers = [(k, v) for k, v in headers if k.lower() not in _HOP_BY_HOP]
+        sent_headers = False
         try:
-            upstream = await self._client.request(
+            async with self._client.stream(
                 method, url, headers=fwd_headers, content=body or None
-            )
+            ) as upstream:
+                resp_headers = [
+                    (k, v)
+                    for k, v in upstream.headers.items()
+                    if k.lower() not in _HOP_BY_HOP and k.lower() != "content-length"
+                ]
+                bodyless = (
+                    method == "HEAD"
+                    or upstream.status_code in (204, 304)
+                    or upstream.status_code < 200
+                )
+                reason = upstream.reason_phrase.encode("latin-1")
+                if bodyless:
+                    resp_headers.append(("content-length", "0"))
+                    writer.write(conn.send(h11.Response(
+                        status_code=upstream.status_code, headers=resp_headers, reason=reason)))
+                    writer.write(conn.send(h11.EndOfMessage()))
+                    sent_headers = True
+                    await writer.drain()
+                    return
+                resp_headers.append(("transfer-encoding", "chunked"))
+                writer.write(conn.send(h11.Response(
+                    status_code=upstream.status_code, headers=resp_headers, reason=reason)))
+                sent_headers = True
+                await writer.drain()
+                async for chunk in upstream.aiter_raw():
+                    if chunk:
+                        writer.write(conn.send(h11.Data(data=chunk)))
+                        await writer.drain()
+                writer.write(conn.send(h11.EndOfMessage()))
+                await writer.drain()
         except httpx.HTTPError as exc:
             log.debug("upstream error for %s: %s", url, exc)
-            await self._send_bad_gateway(conn, writer)
-            return
+            if not sent_headers:
+                await self._send_bad_gateway(conn, writer)
+            # else: partial response already streamed; caller tears the conn down
 
-        resp_headers = [
-            (k, v) for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP
-        ]
-        content = upstream.content
-        # Normalise framing: we send an explicit content-length ourselves.
-        resp_headers = [(k, v) for k, v in resp_headers if k.lower() != "content-length"]
-        resp_headers.append(("content-length", str(len(content))))
-        writer.write(
-            conn.send(
-                h11.Response(
-                    status_code=upstream.status_code,
-                    headers=resp_headers,
-                    reason=upstream.reason_phrase.encode("latin-1"),
-                )
+    async def _relay_websocket(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+        request: h11.Request,
+        trailing: bytes,
+    ) -> None:
+        """Blind-tunnel a WebSocket (fail-open, §5).
+
+        We've terminated client TLS, so we open a fresh TLS connection to the
+        upstream, replay the handshake, then pipe the decrypted byte streams both
+        ways. Content is not inspected here (fail-open); because mainstream AI
+        sites send the prompt via HTTP POST (which we do inspect), this is not a
+        DLP gap for them. A future phase can parse WS frames here for DLP.
+        """
+        try:
+            up_reader, up_writer = await asyncio.open_connection(
+                host, port, ssl=self._ws_ssl_ctx, server_hostname=host
             )
-        )
-        writer.write(conn.send(h11.Data(data=content)))
-        writer.write(conn.send(h11.EndOfMessage()))
-        await writer.drain()
+        except (OSError, ssl.SSLError) as exc:
+            log.debug("WebSocket upstream connect failed %s:%s: %s", host, port, exc)
+            return
+        log.info("WebSocket relayed (fail-open) to %s%s", host, request.target.decode("latin-1"))
+        up_writer.write(_rebuild_request_bytes(request))
+        if trailing:
+            up_writer.write(trailing)
+        try:
+            await up_writer.drain()
+            # Pipe both directions; when EITHER side closes, stop the other so we
+            # don't deadlock waiting on a half-open connection.
+            c2u = asyncio.create_task(_pipe(reader, up_writer))
+            u2c = asyncio.create_task(_pipe(up_reader, writer))
+            _done, pending = await asyncio.wait({c2u, u2c}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+        except (ConnectionError, ssl.SSLError, OSError):
+            pass
+        finally:
+            await _safe_close(up_writer)
 
     async def _send_bad_gateway(self, conn: h11.Connection, writer: asyncio.StreamWriter) -> None:
         payload = b"upstream unavailable"
@@ -415,6 +491,42 @@ def _upstream_url(host: str, port: int, path: str) -> str:
         return path
     netloc = host if port == 443 else f"{host}:{port}"
     return f"https://{netloc}{path}"
+
+
+def _is_ws_upgrade(headers: list[tuple[bytes, bytes]]) -> bool:
+    """True if these request headers are a WebSocket upgrade handshake."""
+    has_upgrade_ws = False
+    has_conn_upgrade = False
+    for k, v in headers:
+        kl = k.decode("latin-1").lower()
+        vl = v.decode("latin-1").lower()
+        if kl == "upgrade" and "websocket" in vl:
+            has_upgrade_ws = True
+        elif kl == "connection" and "upgrade" in vl:
+            has_conn_upgrade = True
+    return has_upgrade_ws and has_conn_upgrade
+
+
+def _rebuild_request_bytes(request: h11.Request) -> bytes:
+    """Reconstruct the raw HTTP/1.1 request line + headers for replay upstream."""
+    out = [request.method + b" " + request.target + b" HTTP/1.1\r\n"]
+    for k, v in request.headers:
+        out.append(k + b": " + v + b"\r\n")
+    out.append(b"\r\n")
+    return b"".join(out)
+
+
+async def _pipe(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Copy bytes one direction until EOF (used for WebSocket relay)."""
+    try:
+        while True:
+            data = await reader.read(_CHUNK)
+            if not data:
+                break
+            writer.write(data)
+            await writer.drain()
+    except (ConnectionError, ssl.SSLError, OSError):
+        pass
 
 
 ClientHandler = Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]]

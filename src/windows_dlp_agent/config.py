@@ -35,6 +35,12 @@ class Config:
     # an int (0 => ephemeral) enables it on 127.0.0.1.
     control_port: int | None = None
 
+    # WebSocket policy: "relay" (fail-open) tunnels WS through unscanned so sites
+    # keep working; "block" (fail-closed) refuses the upgrade. The user's prompt
+    # to mainstream AI sites goes via HTTP POST (still inspected), so "relay" does
+    # not create a gap there; "block" is stricter but breaks WS-based apps.
+    websocket_policy: str = "relay"
+
     # Policy: which engine Action maps to actually dropping the request.
     # WARN and BLOCK both stop the request (warn = block + override prompt, §4.3/§5).
     def __post_init__(self) -> None:

@@ -32,8 +32,9 @@ register_service("127.0.0.1", "TestAI")
 class _Upstream:
     """Minimal HTTPS/1.1 echo server that records what it received."""
 
-    def __init__(self, ca: CertificateAuthority):
+    def __init__(self, ca: CertificateAuthority, payload: bytes = b"upstream-ok"):
         self._ctx = ca.context_for("127.0.0.1")
+        self._payload = payload
         self.hits: list[bytes] = []
         self.server: asyncio.AbstractServer | None = None
         self.port: int = 0
@@ -66,7 +67,7 @@ class _Upstream:
                 writer.close()
                 return
         self.hits.append(bytes(body))
-        payload = b"upstream-ok"
+        payload = self._payload
         writer.write(conn.send(h11.Response(status_code=200, headers=[
             ("content-type", "text/plain"),
             ("content-length", str(len(payload))),
@@ -75,6 +76,42 @@ class _Upstream:
         writer.write(conn.send(h11.EndOfMessage()))
         await writer.drain()
         writer.close()
+
+
+class _WsUpstream:
+    """Minimal WebSocket upstream: 101 handshake then echoes "echo:"+bytes."""
+
+    def __init__(self, ca: CertificateAuthority):
+        self._ctx = ca.context_for("127.0.0.1")
+        self.server: asyncio.AbstractServer | None = None
+        self.port: int = 0
+        self.handshakes: list[bytes] = []
+
+    async def start(self) -> int:
+        self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0, ssl=self._ctx)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self.port
+
+    async def stop(self) -> None:
+        if self.server:
+            self.server.close()
+            await self.server.wait_closed()
+
+    async def _handle(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        handshake = await reader.readuntil(b"\r\n\r\n")
+        self.handshakes.append(handshake)
+        writer.write(
+            b"HTTP/1.1 101 Switching Protocols\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
+        )
+        await writer.drain()
+        while True:
+            data = await reader.read(4096)
+            if not data:
+                break
+            writer.write(b"echo:" + data)
+            await writer.drain()
 
 
 async def _proxy_roundtrip(proxy_port: int, ca: CertificateAuthority, upstream_port: int,
@@ -277,4 +314,96 @@ async def test_block_tier_cannot_be_overridden(tmp_path):
     finally:
         await proxy.aclose()
         await upstream.stop()
+
+
+# --- streaming response passthrough -----------------------------------------
+
+
+async def test_large_response_streams_intact(tmp_path):
+    # A response bigger than one read must round-trip byte-exact through the
+    # chunked streaming path.
+    big = b"x" * (256 * 1024)
+    ca = CertificateAuthority.generate()
+    upstream = _Upstream(ca, payload=big)
+    await upstream.start()
+    config = Config(host="127.0.0.1", port=0, ca_dir=tmp_path / "ca", upstream_verify=False)
+    proxy = MitmProxy(config, ca=ca, notifier=RecordingNotifier())
+    await proxy.start()
+    try:
+        status, resp = await _proxy_roundtrip(
+            proxy.port, ca, upstream.port, _chatgpt_body("hello world"),
+        )
+        assert status == 200
+        assert resp == big
+    finally:
+        await proxy.aclose()
+        await upstream.stop()
+
+
+# --- WebSocket relay (fail-open) / block (fail-closed) ----------------------
+
+
+async def _ws_handshake(proxy_port: int, ca: CertificateAuthority, ws_port: int):
+    reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+    writer.write(f"CONNECT 127.0.0.1:{ws_port} HTTP/1.1\r\n\r\n".encode())
+    await writer.drain()
+    assert b"200" in await reader.readuntil(b"\r\n\r\n")
+    client_ctx = ssl.create_default_context()
+    with tempfile.NamedTemporaryFile("wb", suffix=".crt", delete=False) as f:
+        f.write(ca.cert_pem())
+        ca_file = f.name
+    client_ctx.load_verify_locations(ca_file)
+    Path(ca_file).unlink(missing_ok=True)
+    await writer.start_tls(client_ctx, server_hostname="127.0.0.1")
+    writer.write(
+        b"GET /ws HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+        b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+        b"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    await writer.drain()
+    return reader, writer
+
+
+async def test_websocket_relayed_fail_open(tmp_path):
+    ca = CertificateAuthority.generate()
+    ws = _WsUpstream(ca)
+    await ws.start()
+    config = Config(host="127.0.0.1", port=0, ca_dir=tmp_path / "ca", upstream_verify=False)
+    proxy = MitmProxy(config, ca=ca, notifier=RecordingNotifier())  # default policy = relay
+    await proxy.start()
+    try:
+        reader, writer = await _ws_handshake(proxy.port, ca, ws.port)
+        resp = await reader.readuntil(b"\r\n\r\n")
+        assert b"101" in resp  # upgrade relayed through
+
+        writer.write(b"ping-frame")
+        await writer.drain()
+        echoed = await reader.readexactly(len(b"echo:ping-frame"))
+        assert echoed == b"echo:ping-frame"  # bidirectional bytes flow
+        writer.close()
+    finally:
+        await proxy.aclose()
+        await ws.stop()
+
+
+async def test_websocket_blocked_fail_closed(tmp_path):
+    ca = CertificateAuthority.generate()
+    ws = _WsUpstream(ca)
+    await ws.start()
+    config = Config(
+        host="127.0.0.1", port=0, ca_dir=tmp_path / "ca",
+        upstream_verify=False, websocket_policy="block",
+    )
+    proxy = MitmProxy(config, ca=ca, notifier=RecordingNotifier())
+    await proxy.start()
+    try:
+        reader, writer = await _ws_handshake(proxy.port, ca, ws.port)
+        resp = await reader.readuntil(b"\r\n\r\n")
+        assert b"451" in resp  # upgrade refused
+        assert ws.handshakes == []  # upstream never contacted
+        writer.close()
+    finally:
+        await proxy.aclose()
+        await ws.stop()
 

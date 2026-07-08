@@ -45,6 +45,12 @@ fingerprint from the audit log / toast, against the running proxy's control port
 python -m windows_dlp_agent override <fingerprint> --control-port 8081
 ```
 
+Responses stream back chunk-by-chunk (so token-by-token AI replies aren't
+buffered). WebSocket connections are **relayed** (fail-open) by default so sites
+keep working; the user's prompt to mainstream AI sites goes via HTTP POST which
+is still inspected. Use `--websocket block` for a fail-closed policy that refuses
+WebSocket upgrades (stricter, but breaks WS-based apps).
+
 Use `-v` / `-vv` for info / debug logging.
 
 ## Testing
@@ -64,7 +70,7 @@ Modules:
 | `dlp/` | §4 | Layered detection engine (regex + checksums + entropy + keywords), precision-tiered actions |
 | `ca.py` | §3.2 | Root CA load/generate + per-host forged leaf certs, ALPN-pinned server contexts |
 | `extract.py` | §4.4 | Pull the AI prompt out of intercepted request bodies (ChatGPT/Claude/Gemini + generic) |
-| `proxy.py` | §3.1/§5 | asyncio explicit MITM proxy: CONNECT, TLS terminate, DLP hook, block (451) or forward |
+| `proxy.py` | §3.1/§5 | asyncio explicit MITM proxy: CONNECT, TLS terminate, DLP hook, block (451) or streamed forward; WebSocket relay/block |
 | `notify.py` | §5 | Windows toast on a hit (no-op fallback off-Windows) |
 | `override.py` | §5 | One-shot, TTL-bounded warn-with-override keyed by content fingerprint |
 | `control.py` | §5 | Loopback control endpoint to grant overrides |

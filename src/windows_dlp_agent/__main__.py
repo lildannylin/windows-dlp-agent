@@ -25,6 +25,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ca-dir", type=Path, default=None, help="CA directory (default ~/.windows-dlp-agent/ca)")
     p.add_argument("--audit-log", type=Path, default=None, help="JSONL audit log path (spec section 5)")
     p.add_argument("--control-port", type=int, default=None, help="loopback override control port (spec section 5)")
+    p.add_argument("--websocket", choices=["relay", "block"], default="relay",
+                   help="WebSocket policy: relay (fail-open, default) or block (fail-closed)")
     p.add_argument("-v", "--verbose", action="count", default=0, help="-v info, -vv debug")
 
     sub = p.add_subparsers(dest="command")
@@ -97,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
         config.audit_log = Path(args.audit_log)
     if args.control_port is not None:
         config.control_port = args.control_port
+    config.websocket_policy = args.websocket
 
     if args.command == "export-ca":
         return _run_export_ca(config, args.output)
