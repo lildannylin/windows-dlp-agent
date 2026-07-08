@@ -250,7 +250,9 @@ class MitmProxy:
                 log.debug("no prompt extracted from %s%s (body %d bytes)", host, path, len(body))
             return Decision(Action.ALLOW), None
         if service_for_host(host):
-            log.debug("extracted %d chars from %s%s: %r…", len(prompt), host, path, prompt[:80])
+            # Log only the length, never the prompt text — this is a DLP tool and
+            # the debug log must not become a leak surface (cf. §5 masked audit).
+            log.debug("extracted %d chars of prompt from %s%s", len(prompt), host, path)
         decision = self.engine.evaluate(prompt)
         if decision.action is not Action.ALLOW:
             log.info(
