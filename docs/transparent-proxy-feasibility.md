@@ -10,7 +10,8 @@
 
 - **技術上完全可行,而且是成熟做法**——這不是實驗性的:**整個端點 SWG/DLP 產業(Zscaler、Netskope、Forcepoint、Digital Guardian…)就是這樣運作的**(見 §1)。
 - **他們處理 QUIC 和 ECH 的方式,和本研究的推論完全一致**:**封 QUIC 逼 TCP fallback**(Zscaler 明列為最佳實務,「不影響使用者體驗」)、**在受管裝置上停用/降級 ECH** 讓 SNI 明文(Cisco 三層策略)。
-- **代價**:一張**簽章的核心驅動** + **同時壓制 QUIC 和 ECH**;**且這一切只在「裝置信任你的 CA」時成立**(= 受管端點)。
+- **成本**:**可以做到零元、全開源**——用 **WinDivert**(附已簽章驅動,(L)GPL 開源免費)重導,QUIC/ECH 用免費的 Chrome 政策壓,CA/DLP 是你自己的碼。唯一要花錢的「自寫核心驅動的 EV 簽章」**可用 WinDivert 避開**(見 §1.4、§3)。
+- **代價(非金錢)**:WinDivert 有 AV 誤標 / Wi-Fi 取捨;要同時壓制 QUIC 和 ECH;**且這一切只在「裝置信任你的 CA」時成立**(= 受管端點)。
 - **定位建議**:當 **catch-all 補網層**(收非瀏覽器 / 不理會 proxy 的 app),**不要取代 explicit**——因為若你已能推政策,explicit 更省事且免費解掉 QUIC + host 辨識 + ECH。
 
 ---
@@ -32,13 +33,13 @@
 1. **端點本機 MITM**(Zscaler Client Connector、多數端點 DLP、**本專案**):在端點上就地解密、就地檢查。
 2. **導流到雲**(Netskope):端點 transparent 導流,把流量丟進 TLS/DTLS tunnel 到雲端再檢查。
 
-### 1.2 現成建構元件(你不必從零刻驅動)
+### 1.2 建構元件(本研究只採用開源/免費)
 
-| 元件 | 類型 | 定位 |
+| 元件 | 授權 / 成本 | 採用? |
 |---|---|---|
-| **NetFilter SDK** | 商用 Windows SDK | 現成的 WFP-based transparent proxy/filtering SDK——**買它就省掉自寫核心驅動** |
-| **WinDivert** | 開源(LGPL,簽章驅動)| user-mode 封包 divert,原型首選 |
-| **自寫 WFP callout 驅動** | 微軟原生 API | 最大控制、最穩,但最花工 + 要 EV 簽章 |
+| **WinDivert** | (L)GPLv3,**開源免費**,附已簽章驅動 | ✅ **主推**(免自己買憑證簽)|
+| **自寫 WFP callout 驅動** | 程式開源免費,但**驅動簽章要 EV 憑證($)** | ⚠️ 選配(堅持零成本就別走)|
+| **NetFilter SDK** | **商用,要授權費** | ❌ 不採用(僅當佐證)|
 
 ### 1.3 開源參考實作
 
@@ -52,6 +53,24 @@
 
 **小結**:transparent 端點 TLS 攔截**不是可行性未知的東西,而是一個成熟產業的標準架構**。真正的問題不是「行不行」,而是「**你願不願意付驅動 + QUIC + ECH 的複雜度成本,以及這些成本相對 explicit 值不值得**」。
 
+### 1.4 全開源 / 零成本技術棧(本研究採用)
+
+**要求:不付任何錢、全用開源。** 這是做得到的,對應如下:
+
+| 需求 | 開源/免費方案 | 花錢嗎 |
+|---|---|---|
+| 重導 TCP:443 → 本機 proxy | **WinDivert**((L)GPL,附已簽章驅動)| ❌ 免費 |
+| 消滅 QUIC | Chrome 政策 `QuicAllowed=0`,或防火牆/WinDivert 封 UDP:443 | ❌ 免費 |
+| 停用 ECH(讓 SNI 明文)| Chrome 政策 `EncryptedClientHelloEnabled=0` | ❌ 免費 |
+| 還原目的地 + 認 host | WinDivert tuple + 自寫 SNI 解析 | ❌ 免費(你的碼)|
+| 偽造憑證 / CA | 自簽 CA(`cryptography`)+ `certutil` | ❌ 免費(你的碼)|
+| DLP 解密引擎 | **本專案現有的 `ca.py` / `dlp/` / proxy** | ❌ 免費(你的碼)|
+| 參考實作 | HttpFilteringEngine、SSLsplit、mitmproxy | ❌ 免費(開源)|
+
+> **唯一的「錢」陷阱**:若你**自寫**核心 WFP 驅動,要 EV 憑證簽章才能在 Secure Boot 下載入。
+> **避開方法**:**用 WinDivert**(它的驅動已簽好、可依 (L)GPL 免費用於開源專案)。
+> 所以只要你走 WinDivert,**整條路徑 0 元**。
+
 ---
 
 ## 2. 要解決的三個子問題
@@ -64,24 +83,26 @@
 
 ---
 
-## 3. 子問題 A:重導 — 三個實作層級
+## 3. 子問題 A:重導 — 開源方案(零成本)
 
-### A1. 自寫 WFP connect-redirect callout 驅動(原生、最穩)★ 產品級
+> **成本前提**:全程只用**開源、免費**的方案。唯一會碰到錢的是「**自寫核心驅動要 EV 憑證簽章**」——**用 WinDivert 就完全避開**(它附已簽好的驅動)。所以推薦路徑是 **A1(WinDivert)**;A2 只在你將來想擺脫 WinDivert 缺點、且願意自己弄簽章時才考慮。
+
+### A1. WinDivert(開源、免費、免自己簽章)★ 推薦
+user-mode 封包 divert,底層是一張**作者已簽章的 WFP 驅動**,把 TCP:443 重導到 loopback。
+
+- **授權**:(L)GPLv3——**開源專案免費**(閉源商用才需付費授權;你要開源,免費)。
+- **零簽章成本**:你**沿用它預先簽好的驅動**,不必自己買 EV 憑證。
+- 有 **HttpFilteringEngine**(WinDivert 透明 TLS proxy)、**ProxyBridge** 等開源可參考。
+- **缺點(都不用花錢,但要接受)**:**防毒常誤標**;**某些 Wi-Fi 介面卡有已知限制**(driver 邊界跨不過去,實測有人栽在這);封包重注要自己處理。
+
+### A2. 自寫 WFP connect-redirect callout 驅動(開源,但簽章要錢)★ 進階選配
 Windows Filtering Platform 內建的 **ALE connect-redirect**,**Microsoft 官方文件明講就是給 TLS inspection 用的**(Win7+,本機重導 Win8+):
 
-- callout 在 `FWPM_LAYER_ALE_CONNECT_REDIRECT_V4/V6` 把連線重導到本機 proxy(loopback),填 `localRedirectTargetPID` + `localRedirectHandle`,把**原始目的地存進 `localRedirectContext`**。
-- proxy 用 `WSAIoctl` 查 **`SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT`** 拿**原始目的地 IP:port**,再用 `SIO_SET_WFP_CONNECTION_REDIRECT_RECORDS` 在對外 socket 關聯連線。
-- **支援 TCP 與 UDP**;`FwpsQueryConnectionRedirectState0` 防無限重導。
-- 優點:原生、無 Wi-Fi 限制、微軟背書、拿得到原始目的地。缺點:C 核心驅動、EV 簽章、開發複雜。
+- callout 在 `FWPM_LAYER_ALE_CONNECT_REDIRECT_V4/V6` 把連線重導到本機 proxy(loopback),把**原始目的地存進 `localRedirectContext`**;proxy 用 `WSAIoctl` 查 **`SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT`** 拿**原始目的地 IP:port**。**支援 TCP 與 UDP**。
+- 程式碼**你自己寫 = 開源、免費**;優點:原生、無 Wi-Fi 限制、拿得到原始目的地。
+- ⚠️ **唯一的錢**:自製核心驅動要能在 Secure Boot 下載入,需 **EV/attestation 簽章(要買憑證)**。**若堅持零成本,就別走這條、用 A1**。(自己開發測試可用 test-signing 模式,免費,但需關 Secure Boot,不適合真部署。)
 
-### A2. NetFilter SDK(商用捷徑)★ 想省事又要穩
-**現成的商用 WFP SDK**——把「重導 + 原始目的地還原」封裝好,**免自寫核心驅動**。代價是授權費。多數不想碰核心的商用產品走這條。
-
-### A3. WinDivert(user-mode,快速原型)★ PoC 用
-user-mode 封包 divert(底層是簽章 WFP 驅動),把 TCP:443 重導到 loopback。
-
-- 優點:純 user-mode、prebuilt 驅動已簽章、上手快、有 HttpFilteringEngine 可參考。
-- 缺點:**防毒常誤標**;**Wi-Fi 介面卡有已知限制**(某些 Wi-Fi driver 邊界跨不過去,實測有人栽在這);商用要自簽驅動;封包重注要自己處理。
+> **不列入方案**:NetFilter SDK 等**商用 SDK** 要授權費,與「零成本」牴觸,本研究**不採用**——僅在 §1 當「產業確實這樣做」的佐證,不是要你買。
 
 ---
 
@@ -160,10 +181,11 @@ GPO / 登錄 `Software\Policies\Google\Chrome\QuicAllowed=0` → **Chrome 完全
 4. host 拿到後,**沿用現有的 `ca.py` 偽造憑證 + `dlp/` + 串流轉發**——引擎不動。
 5. 參考 **HttpFilteringEngine** 的 WinDivert 用法。
 
-**產品(數月,穩定):**
-- 改用 **WFP connect-redirect callout 驅動**(或買 **NetFilter SDK** 省事),EV 簽章。
-- 受管政策一併推 `QuicAllowed=0` + `EncryptedClientHelloEnabled=0`。
-- ECH 殘留連線用 Cisco Layer 1/3(封 DNS HTTPS record / 剝 ECH downgrade)兜底。
+**產品(數月,穩定)——維持零成本:**
+- **繼續用 WinDivert**(免費、驅動已簽),接受它的 AV 誤標 / Wi-Fi 取捨——這是零元路線。
+- 受管政策一併推 `QuicAllowed=0` + `EncryptedClientHelloEnabled=0`(免費)。
+- ECH 殘留連線用 Cisco Layer 1(封 DNS HTTPS record,免費)兜底。
+- (**選配、且要花錢**)若日後要擺脫 WinDivert 缺點做更精緻的產品,才考慮**自寫 WFP callout 驅動 + 買 EV 憑證簽章**——非必要。
 
 ---
 
@@ -171,7 +193,7 @@ GPO / 登錄 `Software\Policies\Google\Chrome\QuicAllowed=0` → **Chrome 完全
 
 | 風險 | 說明 |
 |---|---|
-| **驅動簽章** | WFP callout 要 EV/attestation 簽章;WinDivert 商用要自簽;NetFilter SDK 要授權費 |
+| **驅動簽章($)** | **走 WinDivert 免費**(附已簽驅動,(L)GPL 開源用途免付費);**只有自寫 WFP 驅動**才要買 EV 憑證——可避開 |
 | **防毒誤標** | WinDivert 常被 AV 標記 |
 | **Wi-Fi 限制** | WinDivert 在某些 Wi-Fi 介面卡跨不過 driver 邊界(WFP callout / NetFilter 無此問題)|
 | **ECH 軍備競賽** | ECH 預設開、持續演進;靠政策/DNS 壓制是持續維護成本;**訪客/非受管裝置無解** |
